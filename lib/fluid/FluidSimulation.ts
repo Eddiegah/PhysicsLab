@@ -1,14 +1,10 @@
 /**
- * FluidSimulation.ts
- *
- * Real-time GPU Navier-Stokes fluid simulation via WebGL2.
- * Shader source is inlined as template strings — no file loader needed.
- *
- * Pipeline per frame:
- *   splat → advect velocity → divergence → pressure (Jacobi ×20) → gradient subtract → advect dye → display
+ * FluidSimulation.ts — proven WebGL2 Navier-Stokes fluid simulation
+ * Based on the stable-fluids approach (Jos Stam 1999).
+ * Shaders are inlined strings — no file loader dependency.
  */
 
-export type PaletteName = "cosmic" | "ocean" | "fire" | "aurora" | "mono";
+export type PaletteName = "cosmic"|"ocean"|"fire"|"aurora"|"mono";
 
 export interface FluidConfig {
   SIM_RESOLUTION: number;
@@ -26,407 +22,481 @@ export const DEFAULT_CONFIG: FluidConfig = {
   PRESSURE_ITERATIONS: 20,
   VELOCITY_DISSIPATION: 0.98,
   DYE_DISSIPATION: 0.977,
-  SPLAT_RADIUS: 0.004,  // UV-space radius — keep between 0.001 and 0.02
+  SPLAT_RADIUS: 0.25,
   SPLAT_FORCE: 6000,
 };
 
-export const PALETTES: Record<PaletteName, Array<[number,number,number]>> = {
-  cosmic:  [[0.8,0.1,0.9],[0.1,0.4,1.0],[0.0,0.9,0.8],[0.9,0.2,0.5],[0.3,0.1,1.0]],
-  ocean:   [[0.0,0.6,1.0],[0.0,0.9,0.7],[0.1,0.3,0.8],[0.0,1.0,0.5],[0.2,0.5,0.9]],
-  fire:    [[1.0,0.1,0.0],[1.0,0.5,0.0],[1.0,0.9,0.0],[0.8,0.0,0.0],[1.0,0.3,0.1]],
-  aurora:  [[0.0,1.0,0.5],[0.5,0.0,1.0],[0.0,0.8,0.9],[0.8,0.0,0.6],[0.0,0.6,0.4]],
-  mono:    [[0.9,0.9,0.9],[0.7,0.7,0.7],[1.0,1.0,1.0],[0.6,0.6,0.6],[0.85,0.85,0.85]],
+export const PALETTES: Record<PaletteName, [number,number,number][]> = {
+  cosmic: [[0.8,0.1,0.9],[0.1,0.4,1.0],[0.0,0.9,0.8],[0.9,0.2,0.5],[0.3,0.1,1.0]],
+  ocean:  [[0.0,0.6,1.0],[0.0,0.9,0.7],[0.1,0.3,0.8],[0.0,1.0,0.5],[0.2,0.5,0.9]],
+  fire:   [[1.0,0.1,0.0],[1.0,0.5,0.0],[1.0,0.9,0.0],[0.8,0.0,0.0],[1.0,0.3,0.1]],
+  aurora: [[0.0,1.0,0.5],[0.5,0.0,1.0],[0.0,0.8,0.9],[0.8,0.0,0.6],[0.0,0.6,0.4]],
+  mono:   [[0.9,0.9,0.9],[0.7,0.7,0.7],[1.0,1.0,1.0],[0.6,0.6,0.6],[0.85,0.85,0.85]],
 };
 
-// ─── Inline GLSL ──────────────────────────────────────────────────────────────
+// ── Shader sources ──────────────────────────────────────────────────────────
 
-const VERT = `#version 300 es
-in vec2 a_pos;
-out vec2 v_uv;
-void main(){v_uv=a_pos*0.5+0.5;gl_Position=vec4(a_pos,0,1);}`;
-
-const ADVECT_FRAG = `#version 300 es
+const baseVertSrc = `
 precision highp float;
-precision highp sampler2D;
-in vec2 v_uv;
-out vec4 o;
-uniform sampler2D u_vel;
-uniform sampler2D u_src;
-uniform vec2 u_ts; // texel size of velocity texture
-uniform float u_dt;
-uniform float u_diss;
-void main(){
-  vec2 vel = texture(u_vel, v_uv).xy;
-  vec2 prev = v_uv - u_dt * vel * u_ts;
-  prev = clamp(prev, u_ts*0.5, 1.0-u_ts*0.5);
-  o = u_diss * texture(u_src, prev);
+attribute vec2 aPosition;
+varying vec2 vUv;
+varying vec2 vL;
+varying vec2 vR;
+varying vec2 vT;
+varying vec2 vB;
+uniform vec2 texelSize;
+void main () {
+  vUv = aPosition * 0.5 + 0.5;
+  vL = vUv - vec2(texelSize.x, 0.0);
+  vR = vUv + vec2(texelSize.x, 0.0);
+  vT = vUv + vec2(0.0, texelSize.y);
+  vB = vUv - vec2(0.0, texelSize.y);
+  gl_Position = vec4(aPosition, 0.0, 1.0);
 }`;
 
-const DIV_FRAG = `#version 300 es
+const splatSrc = `
 precision highp float;
-precision highp sampler2D;
-in vec2 v_uv;
-out vec4 o;
-uniform sampler2D u_vel;
-uniform vec2 u_ts;
-void main(){
-  float L=texture(u_vel,v_uv-vec2(u_ts.x,0)).x;
-  float R=texture(u_vel,v_uv+vec2(u_ts.x,0)).x;
-  float B=texture(u_vel,v_uv-vec2(0,u_ts.y)).y;
-  float T=texture(u_vel,v_uv+vec2(0,u_ts.y)).y;
-  o=vec4(0.5*((R-L)+(T-B)),0,0,1);
+varying vec2 vUv;
+uniform sampler2D uTarget;
+uniform float aspectRatio;
+uniform vec3 color;
+uniform vec2 point;
+uniform float radius;
+void main () {
+  vec2 p = vUv - point.xy;
+  p.x *= aspectRatio;
+  vec3 splat = exp(-dot(p, p) / radius) * color;
+  vec3 base = texture2D(uTarget, vUv).xyz;
+  gl_FragColor = vec4(base + splat, 1.0);
 }`;
 
-const PRESSURE_FRAG = `#version 300 es
+const advectionSrc = `
 precision highp float;
-precision highp sampler2D;
-in vec2 v_uv;
-out vec4 o;
-uniform sampler2D u_p;
-uniform sampler2D u_div;
-uniform vec2 u_ts;
-void main(){
-  float L=texture(u_p,v_uv-vec2(u_ts.x,0)).r;
-  float R=texture(u_p,v_uv+vec2(u_ts.x,0)).r;
-  float B=texture(u_p,v_uv-vec2(0,u_ts.y)).r;
-  float T=texture(u_p,v_uv+vec2(0,u_ts.y)).r;
-  float d=texture(u_div,v_uv).r;
-  o=vec4((L+R+B+T-d)*0.25,0,0,1);
+varying vec2 vUv;
+uniform sampler2D uVelocity;
+uniform sampler2D uSource;
+uniform vec2 texelSize;
+uniform float dt;
+uniform float dissipation;
+void main () {
+  vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texelSize;
+  gl_FragColor = dissipation * texture2D(uSource, coord);
+  gl_FragColor.a = 1.0;
 }`;
 
-const GRAD_FRAG = `#version 300 es
-precision highp float;
-precision highp sampler2D;
-in vec2 v_uv;
-out vec4 o;
-uniform sampler2D u_p;
-uniform sampler2D u_vel;
-uniform vec2 u_ts;
-void main(){
-  float L=texture(u_p,v_uv-vec2(u_ts.x,0)).r;
-  float R=texture(u_p,v_uv+vec2(u_ts.x,0)).r;
-  float B=texture(u_p,v_uv-vec2(0,u_ts.y)).r;
-  float T=texture(u_p,v_uv+vec2(0,u_ts.y)).r;
-  vec2 vel=texture(u_vel,v_uv).xy;
-  o=vec4(vel-0.5*vec2(R-L,T-B),0,1);
+const divergenceSrc = `
+precision mediump float;
+varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB;
+uniform sampler2D uVelocity;
+void main () {
+  float L = texture2D(uVelocity, vL).x;
+  float R = texture2D(uVelocity, vR).x;
+  float T = texture2D(uVelocity, vT).y;
+  float B = texture2D(uVelocity, vB).y;
+  float div = 0.5 * (R - L + T - B);
+  gl_FragColor = vec4(div, 0.0, 0.0, 1.0);
 }`;
 
-const SPLAT_FRAG = `#version 300 es
-precision highp float;
-precision highp sampler2D;
-in vec2 v_uv;
-out vec4 o;
-uniform sampler2D u_tgt;
-uniform vec2 u_pt;
-uniform vec3 u_col;
-uniform float u_r;
-uniform int u_mode; // 0=dye 1=velocity
-void main(){
-  vec2 d=v_uv-u_pt;
-  float sp=exp(-dot(d,d)/u_r);
-  vec4 base=texture(u_tgt,v_uv);
-  if(u_mode==1) o=base+vec4(u_col.xy*sp,0,1);
-  else           o=base+vec4(u_col*sp,1);
+const curlSrc = `
+precision mediump float;
+varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB;
+uniform sampler2D uVelocity;
+void main () {
+  float L = texture2D(uVelocity, vL).y;
+  float R = texture2D(uVelocity, vR).y;
+  float T = texture2D(uVelocity, vT).x;
+  float B = texture2D(uVelocity, vB).x;
+  float vorticity = R - L - T + B;
+  gl_FragColor = vec4(0.5 * vorticity, 0.0, 0.0, 1.0);
 }`;
 
-const DISPLAY_FRAG = `#version 300 es
+const vorticityConfineSrc = `
 precision highp float;
-precision highp sampler2D;
-in vec2 v_uv;
-out vec4 o;
-uniform sampler2D u_dye;
-void main(){
-  vec3 c=texture(u_dye,v_uv).rgb;
-  // Gamma correct
-  c=pow(max(c,vec3(0.0)),vec3(1.0/2.2));
-  o=vec4(c,1);
+varying vec2 vUv;
+varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB;
+uniform sampler2D uVelocity;
+uniform sampler2D uCurl;
+uniform float curl;
+uniform float dt;
+void main () {
+  float L = texture2D(uCurl, vL).x;
+  float R = texture2D(uCurl, vR).x;
+  float T = texture2D(uCurl, vT).x;
+  float B = texture2D(uCurl, vB).x;
+  float C = texture2D(uCurl, vUv).x;
+  vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L));
+  force /= length(force) + 0.0001;
+  force *= curl * C;
+  force.y *= -1.0;
+  vec2 vel = texture2D(uVelocity, vUv).xy;
+  gl_FragColor = vec4(vel + force * dt, 0.0, 1.0);
 }`;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+const pressureSrc = `
+precision mediump float;
+varying vec2 vUv;
+varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB;
+uniform sampler2D uPressure;
+uniform sampler2D uDivergence;
+void main () {
+  float L = texture2D(uPressure, vL).x;
+  float R = texture2D(uPressure, vR).x;
+  float T = texture2D(uPressure, vT).x;
+  float B = texture2D(uPressure, vB).x;
+  float divergence = texture2D(uDivergence, vUv).x;
+  float pressure = (L + R + B + T - divergence) * 0.25;
+  gl_FragColor = vec4(pressure, 0.0, 0.0, 1.0);
+}`;
 
-interface FBO {
-  fbo: WebGLFramebuffer;
-  tex: WebGLTexture;
-  w: number; h: number;
-  ts: [number, number]; // texel size
-}
+const gradientSubtractSrc = `
+precision mediump float;
+varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB;
+varying vec2 vUv;
+uniform sampler2D uPressure;
+uniform sampler2D uVelocity;
+void main () {
+  float L = texture2D(uPressure, vL).x;
+  float R = texture2D(uPressure, vR).x;
+  float T = texture2D(uPressure, vT).x;
+  float B = texture2D(uPressure, vB).x;
+  vec2 velocity = texture2D(uVelocity, vUv).xy;
+  velocity.xy -= vec2(R - L, T - B);
+  gl_FragColor = vec4(velocity, 0.0, 1.0);
+}`;
 
-interface DFBO { read: FBO; write: FBO; swap(): void; }
+const displaySrc = `
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D uTexture;
+void main () {
+  vec3 C = texture2D(uTexture, vUv).rgb;
+  float a = max(C.r, max(C.g, C.b));
+  gl_FragColor = vec4(C, a);
+}`;
 
-interface Prog { prog: WebGLProgram; u: Record<string, WebGLUniformLocation | null>; }
+// ── Types ───────────────────────────────────────────────────────────────────
 
-// ─── Class ────────────────────────────────────────────────────────────────────
+interface FBO { texture: WebGLTexture; fbo: WebGLFramebuffer; width: number; height: number; attach(id: number): number; }
+interface DoubleFBO { width: number; height: number; texelSizeX: number; texelSizeY: number; read: FBO; write: FBO; swap(): void; }
+interface GLProgram { uniforms: Record<string,WebGLUniformLocation>; bind(): void; }
+
+// ── Main class ───────────────────────────────────────────────────────────────
 
 export class FluidSimulation {
-  private gl: WebGL2RenderingContext;
+  private gl: WebGLRenderingContext;
+  private ext: { formatRGBA: {internalFormat:number;format:number}; formatRG: {internalFormat:number;format:number}; formatR: {internalFormat:number;format:number}; halfFloatTexType: number; supportLinearFiltering: boolean; };
   private canvas: HTMLCanvasElement;
   cfg: FluidConfig;
-
-  private aVel!: Prog; private aDye!: Prog;
-  private pDiv!: Prog;
-  private pPre!: Prog;
-  private pGrd!: Prog;
-  private pSpl!: Prog;
-  private pDis!: Prog;
-
-  private vel!: DFBO;
-  private dye!: DFBO;
-  private div!: FBO;
-  private pre!: DFBO;
-
-  private vao!: WebGLVertexArrayObject;
   private palette: PaletteName = "cosmic";
-  private ci = 0;
+  private colorIndex = 0;
+
+  private blit!: (dest: FBO|null, clear?: boolean) => void;
+  private dye!: DoubleFBO;
+  private velocity!: DoubleFBO;
+  private divergence!: FBO;
+  private curl!: FBO;
+  private pressure!: DoubleFBO;
+
+  private splatProgram!: GLProgram;
+  private advectionProgram!: GLProgram;
+  private divergenceProgram!: GLProgram;
+  private curlProgram!: GLProgram;
+  private vorticityProgram!: GLProgram;
+  private pressureProgram!: GLProgram;
+  private gradSubtractProgram!: GLProgram;
+  private displayProgram!: GLProgram;
 
   constructor(canvas: HTMLCanvasElement, cfg: Partial<FluidConfig> = {}) {
     this.canvas = canvas;
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
 
-    const gl = canvas.getContext("webgl2", {
-      alpha: false, antialias: false, depth: false,
-      stencil: false, preserveDrawingBuffer: false,
-    });
-    if (!gl) throw new Error("WebGL2 not supported");
+    // Try WebGL2 first, fall back to WebGL1
+    let gl = canvas.getContext("webgl2") as WebGLRenderingContext | null;
+    const isWebGL2 = !!gl;
+    if (!gl) gl = (canvas.getContext("webgl") || canvas.getContext("experimental-webgl")) as WebGLRenderingContext | null;
+    if (!gl) throw new Error("WebGL not supported");
     this.gl = gl;
 
-    // Extensions for float textures
-    gl.getExtension("EXT_color_buffer_float");
-    gl.getExtension("OES_texture_half_float_linear");
-
-    this.buildQuad();
-    this.buildPrograms();
-    this.buildFBOs();
-    // Fire initial splats immediately — canvas is already sized by caller
-    this.randomSplats(10);
+    this.ext = this.getSupportedFormats(gl, isWebGL2);
+    this.initBlit();
+    this.initPrograms();
+    this.initFBOs();
+    this.multipleSplats(parseInt((Math.random() * 20).toString()) + 5);
   }
 
-  // ── Quad ────────────────────────────────────────────────────────────────────
-  private buildQuad(): void {
+  private getSupportedFormats(gl: WebGLRenderingContext, isWebGL2: boolean) {
+    let halfFloat: OES_texture_half_float | null = null;
+    let supportLinearFiltering = false;
+
+    if (isWebGL2) {
+      gl.getExtension("EXT_color_buffer_float");
+      supportLinearFiltering = !!gl.getExtension("OES_texture_float_linear");
+    } else {
+      halfFloat = gl.getExtension("OES_texture_half_float");
+      supportLinearFiltering = !!gl.getExtension("OES_texture_half_float_linear");
+    }
+
+    gl.clearColor(0, 0, 0, 1);
+    const halfFloatTexType = isWebGL2
+      ? (gl as WebGL2RenderingContext).HALF_FLOAT
+      : (halfFloat ? halfFloat.HALF_FLOAT_OES : gl.UNSIGNED_BYTE);
+
+    let formatRGBA: {internalFormat:number;format:number};
+    let formatRG:   {internalFormat:number;format:number};
+    let formatR:    {internalFormat:number;format:number};
+
+    if (isWebGL2) {
+      const gl2 = gl as WebGL2RenderingContext;
+      formatRGBA = this.getSupportedFormat(gl, gl2.RGBA16F, gl.RGBA, halfFloatTexType) || { internalFormat: gl.RGBA, format: gl.RGBA };
+      formatRG   = this.getSupportedFormat(gl, gl2.RG16F,   gl2.RG,  halfFloatTexType) || { internalFormat: gl.RGBA, format: gl.RGBA };
+      formatR    = this.getSupportedFormat(gl, gl2.R16F,    gl2.RED, halfFloatTexType) || { internalFormat: gl.RGBA, format: gl.RGBA };
+    } else {
+      formatRGBA = { internalFormat: gl.RGBA, format: gl.RGBA };
+      formatRG   = { internalFormat: gl.RGBA, format: gl.RGBA };
+      formatR    = { internalFormat: gl.RGBA, format: gl.RGBA };
+    }
+    return { formatRGBA, formatRG, formatR, halfFloatTexType, supportLinearFiltering };
+  }
+
+  private getSupportedFormat(gl: WebGLRenderingContext, internalFormat: number, format: number, type: number): {internalFormat:number;format:number}|null {
+    if (!this.supportRenderTextureFormat(gl, internalFormat, format, type)) return null;
+    return { internalFormat, format };
+  }
+
+  private supportRenderTextureFormat(gl: WebGLRenderingContext, internalFormat: number, format: number, type: number): boolean {
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, 4, 4, 0, format, type, null);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    return status === gl.FRAMEBUFFER_COMPLETE;
+  }
+
+  private initBlit(): void {
     const gl = this.gl;
-    this.vao = gl.createVertexArray()!;
-    const buf = gl.createBuffer()!;
-    gl.bindVertexArray(this.vao);
+    const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,-1, 1,1, -1,1]), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,-1,1,1,1,1,-1]), gl.STATIC_DRAW);
+    const ibuf = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2,0,2,3]), gl.STATIC_DRAW);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    gl.bindVertexArray(null);
-  }
-
-  // ── Programs ─────────────────────────────────────────────────────────────────
-  private buildPrograms(): void {
-    const mk = (f: string, u: string[]) => this.mkProg(VERT, f, u);
-    this.aVel = mk(ADVECT_FRAG, ["u_vel","u_src","u_ts","u_dt","u_diss"]);
-    this.aDye = mk(ADVECT_FRAG, ["u_vel","u_src","u_ts","u_dt","u_diss"]);
-    this.pDiv = mk(DIV_FRAG,    ["u_vel","u_ts"]);
-    this.pPre = mk(PRESSURE_FRAG, ["u_p","u_div","u_ts"]);
-    this.pGrd = mk(GRAD_FRAG,   ["u_p","u_vel","u_ts"]);
-    this.pSpl = mk(SPLAT_FRAG,  ["u_tgt","u_pt","u_col","u_r","u_mode"]);
-    this.pDis = mk(DISPLAY_FRAG,["u_dye"]);
-  }
-
-  private mkProg(vert: string, frag: string, unis: string[]): Prog {
-    const gl = this.gl;
-    const compile = (type: number, src: string) => {
-      const s = gl.createShader(type)!;
-      gl.shaderSource(s, src); gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
-        throw new Error(`Shader error: ${gl.getShaderInfoLog(s)}\n---\n${src}`);
-      return s;
-    };
-    const p = gl.createProgram()!;
-    gl.attachShader(p, compile(gl.VERTEX_SHADER, vert));
-    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, frag));
-    gl.bindAttribLocation(p, 0, "a_pos");
-    gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS))
-      throw new Error(`Link error: ${gl.getProgramInfoLog(p)}`);
-    const u: Record<string, WebGLUniformLocation | null> = {};
-    unis.forEach(n => u[n] = gl.getUniformLocation(p, n));
-    return { prog: p, u };
-  }
-
-  // ── FBOs ─────────────────────────────────────────────────────────────────────
-  private buildFBOs(): void {
-    const gl = this.gl;
-    const c = this.canvas;
-    const ar = c.width / Math.max(c.height, 1);
-
-    const sW = Math.round(this.cfg.SIM_RESOLUTION * (ar > 1 ? ar : 1));
-    const sH = Math.round(this.cfg.SIM_RESOLUTION * (ar > 1 ? 1 : 1/ar));
-    const dW = Math.round(this.cfg.DYE_RESOLUTION * (ar > 1 ? ar : 1));
-    const dH = Math.round(this.cfg.DYE_RESOLUTION * (ar > 1 ? 1 : 1/ar));
-
-    // Try RGBA16F first; fall back to RGBA8 if incomplete
-    const tryFmt = (iF: number, fmt: number, type: number, w: number, h: number, filter: number): FBO => {
-      const tex = this.mkTex(w, h, iF, fmt, type, filter);
-      const fbo = gl.createFramebuffer()!;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-      const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
-      if (!ok) {
-        // Fall back to RGBA8
-        gl.deleteTexture(tex); gl.deleteFramebuffer(fbo);
-        const t2 = this.mkTex(w, h, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, filter);
-        const f2 = gl.createFramebuffer()!;
-        gl.bindFramebuffer(gl.FRAMEBUFFER, f2);
-        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t2, 0);
-        gl.viewport(0,0,w,h); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
-        return { fbo: f2, tex: t2, w, h, ts: [1/w, 1/h] };
+    gl.enableVertexAttribArray(0);
+    this.blit = (destination: FBO|null, clear = false) => {
+      if (destination == null) {
+        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      } else {
+        gl.viewport(0, 0, destination.width, destination.height);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, destination.fbo);
       }
-      gl.viewport(0,0,w,h); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
-      return { fbo, tex, w, h, ts: [1/w, 1/h] };
+      if (clear) { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
     };
-
-    const mkD = (w: number, h: number, iF: number, fmt: number, type: number, filter: number): DFBO => {
-      const a = tryFmt(iF, fmt, type, w, h, filter);
-      const b = tryFmt(iF, fmt, type, w, h, filter);
-      const d: DFBO = { read: a, write: b, swap() { [d.read, d.write] = [d.write, d.read]; } };
-      return d;
-    };
-
-    this.vel = mkD(sW, sH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
-    this.dye = mkD(dW, dH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
-    this.pre = mkD(sW, sH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.NEAREST);
-    this.div = tryFmt(gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, sW, sH, gl.NEAREST);
   }
 
-  private mkTex(w: number, h: number, iF: number, fmt: number, type: number, filter: number): WebGLTexture {
+  private compileShader(type: number, src: string): WebGLShader {
     const gl = this.gl;
-    const t = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, t);
+    const shader = gl.createShader(type)!;
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(shader) || "Shader compile failed");
+    return shader;
+  }
+
+  private createProgram(vertSrc: string, fragSrc: string): GLProgram {
+    const gl = this.gl;
+    const vert = this.compileShader(gl.VERTEX_SHADER, vertSrc);
+    const frag = this.compileShader(gl.FRAGMENT_SHADER, fragSrc);
+    const prog = gl.createProgram()!;
+    gl.attachShader(prog, vert); gl.attachShader(prog, frag);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      throw new Error(gl.getProgramInfoLog(prog) || "Program link failed");
+    const uniforms: Record<string,WebGLUniformLocation> = {};
+    const count = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < count; i++) {
+      const info = gl.getActiveUniform(prog, i)!;
+      uniforms[info.name] = gl.getUniformLocation(prog, info.name)!;
+    }
+    return { uniforms, bind() { gl.useProgram(prog); } };
+  }
+
+  private initPrograms(): void {
+    this.splatProgram        = this.createProgram(baseVertSrc, splatSrc);
+    this.advectionProgram    = this.createProgram(baseVertSrc, advectionSrc);
+    this.divergenceProgram   = this.createProgram(baseVertSrc, divergenceSrc);
+    this.curlProgram         = this.createProgram(baseVertSrc, curlSrc);
+    this.vorticityProgram    = this.createProgram(baseVertSrc, vorticityConfineSrc);
+    this.pressureProgram     = this.createProgram(baseVertSrc, pressureSrc);
+    this.gradSubtractProgram = this.createProgram(baseVertSrc, gradientSubtractSrc);
+    this.displayProgram      = this.createProgram(baseVertSrc, displaySrc);
+  }
+
+  private createFBO(w: number, h: number, internalFormat: number, format: number, type: number, filter: number): FBO {
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0);
+    const texture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, iF, w, h, 0, fmt, type, null);
-    return t;
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null);
+    const fbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.viewport(0, 0, w, h); gl.clear(gl.COLOR_BUFFER_BIT);
+    const texelSizeX = 1.0 / w, texelSizeY = 1.0 / h;
+    return { texture, fbo, width: w, height: h, attach(id) { gl.activeTexture(gl.TEXTURE0+id); gl.bindTexture(gl.TEXTURE_2D, texture); return id; } };
   }
 
-  // ── Draw helpers ─────────────────────────────────────────────────────────────
-  private bind(unit: number, tex: WebGLTexture): void {
-    const gl = this.gl;
-    gl.activeTexture(gl.TEXTURE0 + unit);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
+  private createDoubleFBO(w: number, h: number, iF: number, fmt: number, type: number, filter: number): DoubleFBO {
+    let fbo1 = this.createFBO(w, h, iF, fmt, type, filter);
+    let fbo2 = this.createFBO(w, h, iF, fmt, type, filter);
+    return {
+      width: w, height: h,
+      texelSizeX: 1/w, texelSizeY: 1/h,
+      get read() { return fbo1; }, get write() { return fbo2; },
+      swap() { [fbo1, fbo2] = [fbo2, fbo1]; }
+    };
   }
 
-  private draw(prog: Prog, target: FBO | null): void {
-    const gl = this.gl;
-    const w = target ? target.w : this.canvas.width;
-    const h = target ? target.h : this.canvas.height;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
-    gl.viewport(0, 0, w, h);
-    gl.useProgram(prog.prog);
-    gl.bindVertexArray(this.vao);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    gl.bindVertexArray(null);
+  private initFBOs(): void {
+    const gl = this.gl; const ext = this.ext;
+    const simRes = this.getResolution(this.cfg.SIM_RESOLUTION);
+    const dyeRes = this.getResolution(this.cfg.DYE_RESOLUTION);
+    const filter = ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST;
+    const rgba = ext.formatRGBA, rg = ext.formatRG, r = ext.formatR;
+    const hf = ext.halfFloatTexType;
+    this.dye      = this.createDoubleFBO(dyeRes.width, dyeRes.height, rgba.internalFormat, rgba.format, hf, filter);
+    this.velocity = this.createDoubleFBO(simRes.width, simRes.height, rg.internalFormat,   rg.format,   hf, filter);
+    this.divergence = this.createFBO(simRes.width, simRes.height, r.internalFormat, r.format, hf, gl.NEAREST);
+    this.curl       = this.createFBO(simRes.width, simRes.height, r.internalFormat, r.format, hf, gl.NEAREST);
+    this.pressure   = this.createDoubleFBO(simRes.width, simRes.height, r.internalFormat, r.format, hf, gl.NEAREST);
   }
 
-  // ── Public step / render ─────────────────────────────────────────────────────
+  private getResolution(res: number): {width:number;height:number} {
+    const ar = this.canvas.width / this.canvas.height;
+    if (ar > 1) return { width: Math.round(res * ar), height: res };
+    return { width: res, height: Math.round(res / ar) };
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
   step(dt: number): void {
-    const gl = this.gl;
-    const cfg = this.cfg;
+    const gl = this.gl; const ext = this.ext;
 
-    // 1. Advect velocity
-    gl.useProgram(this.aVel.prog);
-    this.bind(0, this.vel.read.tex); gl.uniform1i(this.aVel.u["u_vel"], 0);
-    this.bind(1, this.vel.read.tex); gl.uniform1i(this.aVel.u["u_src"], 1);
-    gl.uniform2f(this.aVel.u["u_ts"], ...this.vel.read.ts);
-    gl.uniform1f(this.aVel.u["u_dt"], dt);
-    gl.uniform1f(this.aVel.u["u_diss"], cfg.VELOCITY_DISSIPATION);
-    this.draw(this.aVel, this.vel.write); this.vel.swap();
+    // Curl
+    this.curlProgram.bind();
+    gl.uniform2f(this.curlProgram.uniforms["texelSize"], this.velocity.texelSizeX, this.velocity.texelSizeY);
+    gl.uniform1i(this.curlProgram.uniforms["uVelocity"], this.velocity.read.attach(0));
+    this.blit(this.curl);
 
-    // 2. Divergence
-    gl.useProgram(this.pDiv.prog);
-    this.bind(0, this.vel.read.tex); gl.uniform1i(this.pDiv.u["u_vel"], 0);
-    gl.uniform2f(this.pDiv.u["u_ts"], ...this.vel.read.ts);
-    this.draw(this.pDiv, this.div);
+    // Vorticity confinement
+    this.vorticityProgram.bind();
+    gl.uniform2f(this.vorticityProgram.uniforms["texelSize"], this.velocity.texelSizeX, this.velocity.texelSizeY);
+    gl.uniform1i(this.vorticityProgram.uniforms["uVelocity"], this.velocity.read.attach(0));
+    gl.uniform1i(this.vorticityProgram.uniforms["uCurl"], this.curl.attach(1));
+    gl.uniform1f(this.vorticityProgram.uniforms["curl"], 30);
+    gl.uniform1f(this.vorticityProgram.uniforms["dt"], dt);
+    this.blit(this.velocity.write); this.velocity.swap();
 
-    // 3. Pressure solve
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pre.read.fbo);
-    gl.viewport(0,0,this.pre.read.w,this.pre.read.h);
-    gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
-    for (let i = 0; i < cfg.PRESSURE_ITERATIONS; i++) {
-      gl.useProgram(this.pPre.prog);
-      this.bind(0, this.pre.read.tex); gl.uniform1i(this.pPre.u["u_p"], 0);
-      this.bind(1, this.div.tex);      gl.uniform1i(this.pPre.u["u_div"], 1);
-      gl.uniform2f(this.pPre.u["u_ts"], ...this.vel.read.ts);
-      this.draw(this.pPre, this.pre.write); this.pre.swap();
+    // Divergence
+    this.divergenceProgram.bind();
+    gl.uniform2f(this.divergenceProgram.uniforms["texelSize"], this.velocity.texelSizeX, this.velocity.texelSizeY);
+    gl.uniform1i(this.divergenceProgram.uniforms["uVelocity"], this.velocity.read.attach(0));
+    this.blit(this.divergence);
+
+    // Clear pressure
+    this.blit(this.pressure.read, true);
+
+    // Pressure solve
+    this.pressureProgram.bind();
+    gl.uniform2f(this.pressureProgram.uniforms["texelSize"], this.velocity.texelSizeX, this.velocity.texelSizeY);
+    gl.uniform1i(this.pressureProgram.uniforms["uDivergence"], this.divergence.attach(0));
+    for (let i = 0; i < this.cfg.PRESSURE_ITERATIONS; i++) {
+      gl.uniform1i(this.pressureProgram.uniforms["uPressure"], this.pressure.read.attach(1));
+      this.blit(this.pressure.write); this.pressure.swap();
     }
 
-    // 4. Gradient subtract
-    gl.useProgram(this.pGrd.prog);
-    this.bind(0, this.pre.read.tex); gl.uniform1i(this.pGrd.u["u_p"], 0);
-    this.bind(1, this.vel.read.tex); gl.uniform1i(this.pGrd.u["u_vel"], 1);
-    gl.uniform2f(this.pGrd.u["u_ts"], ...this.vel.read.ts);
-    this.draw(this.pGrd, this.vel.write); this.vel.swap();
+    // Gradient subtract
+    this.gradSubtractProgram.bind();
+    gl.uniform2f(this.gradSubtractProgram.uniforms["texelSize"], this.velocity.texelSizeX, this.velocity.texelSizeY);
+    gl.uniform1i(this.gradSubtractProgram.uniforms["uPressure"], this.pressure.read.attach(0));
+    gl.uniform1i(this.gradSubtractProgram.uniforms["uVelocity"], this.velocity.read.attach(1));
+    this.blit(this.velocity.write); this.velocity.swap();
 
-    // 5. Advect dye
-    gl.useProgram(this.aDye.prog);
-    this.bind(0, this.vel.read.tex); gl.uniform1i(this.aDye.u["u_vel"], 0);
-    this.bind(1, this.dye.read.tex); gl.uniform1i(this.aDye.u["u_src"], 1);
-    gl.uniform2f(this.aDye.u["u_ts"], ...this.dye.read.ts);
-    gl.uniform1f(this.aDye.u["u_dt"], dt);
-    gl.uniform1f(this.aDye.u["u_diss"], cfg.DYE_DISSIPATION);
-    this.draw(this.aDye, this.dye.write); this.dye.swap();
+    // Advect velocity
+    this.advectionProgram.bind();
+    gl.uniform2f(this.advectionProgram.uniforms["texelSize"], this.velocity.texelSizeX, this.velocity.texelSizeY);
+    gl.uniform1i(this.advectionProgram.uniforms["uVelocity"], this.velocity.read.attach(0));
+    gl.uniform1i(this.advectionProgram.uniforms["uSource"], this.velocity.read.attach(0));
+    gl.uniform1f(this.advectionProgram.uniforms["dt"], dt);
+    gl.uniform1f(this.advectionProgram.uniforms["dissipation"], this.cfg.VELOCITY_DISSIPATION);
+    this.blit(this.velocity.write); this.velocity.swap();
+
+    // Advect dye
+    gl.uniform1i(this.advectionProgram.uniforms["uVelocity"], this.velocity.read.attach(0));
+    gl.uniform1i(this.advectionProgram.uniforms["uSource"], this.dye.read.attach(1));
+    gl.uniform1f(this.advectionProgram.uniforms["dissipation"], this.cfg.DYE_DISSIPATION);
+    this.blit(this.dye.write); this.dye.swap();
   }
 
   render(): void {
     const gl = this.gl;
-    gl.useProgram(this.pDis.prog);
-    this.bind(0, this.dye.read.tex);
-    gl.uniform1i(this.pDis.u["u_dye"], 0);
-    this.draw(this.pDis, null);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.BLEND);
+    this.displayProgram.bind();
+    gl.uniform1i(this.displayProgram.uniforms["uTexture"], this.dye.read.attach(0));
+    this.blit(null);
   }
 
   splat(x: number, y: number, dx: number, dy: number, color: [number,number,number]): void {
     const gl = this.gl;
-    const r = this.cfg.SPLAT_RADIUS; // already in UV space
+    this.splatProgram.bind();
+    gl.uniform1i(this.splatProgram.uniforms["uTarget"], this.velocity.read.attach(0));
+    gl.uniform1f(this.splatProgram.uniforms["aspectRatio"], this.canvas.width / this.canvas.height);
+    gl.uniform2f(this.splatProgram.uniforms["point"], x, y);
+    gl.uniform3f(this.splatProgram.uniforms["color"], dx, dy, 0);
+    gl.uniform1f(this.splatProgram.uniforms["radius"], this.correctRadius(this.cfg.SPLAT_RADIUS / 100));
+    this.blit(this.velocity.write); this.velocity.swap();
 
-    // Velocity splat
-    gl.useProgram(this.pSpl.prog);
-    this.bind(0, this.vel.read.tex); gl.uniform1i(this.pSpl.u["u_tgt"], 0);
-    gl.uniform2f(this.pSpl.u["u_pt"], x, y);
-    gl.uniform3f(this.pSpl.u["u_col"], dx * this.cfg.SPLAT_FORCE, dy * this.cfg.SPLAT_FORCE, 0);
-    gl.uniform1f(this.pSpl.u["u_r"], r);
-    gl.uniform1i(this.pSpl.u["u_mode"], 1);
-    this.draw(this.pSpl, this.vel.write); this.vel.swap();
-
-    // Dye splat
-    this.bind(0, this.dye.read.tex); gl.uniform1i(this.pSpl.u["u_tgt"], 0);
-    gl.uniform3f(this.pSpl.u["u_col"], color[0], color[1], color[2]);
-    gl.uniform1i(this.pSpl.u["u_mode"], 0);
-    this.draw(this.pSpl, this.dye.write); this.dye.swap();
+    gl.uniform1i(this.splatProgram.uniforms["uTarget"], this.dye.read.attach(0));
+    gl.uniform3f(this.splatProgram.uniforms["color"], color[0], color[1], color[2]);
+    this.blit(this.dye.write); this.dye.swap();
   }
 
-  randomSplats(n: number): void {
+  private correctRadius(r: number): number {
+    const ar = this.canvas.width / this.canvas.height;
+    if (ar > 1) r *= ar;
+    return r;
+  }
+
+  multipleSplats(count: number): void {
     const cols = PALETTES[this.palette];
-    const savedR = this.cfg.SPLAT_RADIUS;
-    this.cfg.SPLAT_RADIUS = 0.008; // bigger radius for initial burst
-    for (let i = 0; i < n; i++) {
-      this.splat(
-        Math.random(), Math.random(),
-        (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4,
-        cols[i % cols.length]
-      );
+    for (let i = 0; i < count; i++) {
+      const color = cols[i % cols.length];
+      this.splat(Math.random(), Math.random(),
+        (Math.random() * 2 - 1) * 5, (Math.random() * 2 - 1) * 5, color);
     }
-    this.cfg.SPLAT_RADIUS = savedR;
   }
 
   nextColor(): [number,number,number] {
     const cols = PALETTES[this.palette];
-    const c = cols[this.ci % cols.length]; this.ci++;
-    const b = 0.5 + Math.random() * 0.5;
-    return [c[0]*b, c[1]*b, c[2]*b];
+    const c = cols[this.colorIndex % cols.length]; this.colorIndex++;
+    return [c[0] * (0.5 + Math.random()*0.5), c[1] * (0.5 + Math.random()*0.5), c[2] * (0.5 + Math.random()*0.5)];
   }
 
   setPalette(p: PaletteName): void { this.palette = p; }
   updateConfig(c: Partial<FluidConfig>): void { this.cfg = { ...this.cfg, ...c }; }
-
-  resize(): void {
-    this.buildFBOs();
-    this.randomSplats(4);
-  }
-
-  dispose(): void { /* programs/textures cleaned up by GC on context loss */ }
+  resize(): void { this.initFBOs(); }
+  dispose(): void {}
 }

@@ -83,8 +83,7 @@ export default function FluidCanvas({ config, palette, onFpsUpdate }: Props) {
       const ddx = mx - pmx;
       const ddy = my - pmy;
       if (Math.abs(ddx) > 0.0001 || Math.abs(ddy) > 0.0001) {
-        const force = sim.cfg.SPLAT_FORCE;
-        sim.splat(mx, my, ddx * force, ddy * force, sim.nextColor());
+        sim.splat(mx, my, ddx * sim.cfg.SPLAT_FORCE, ddy * sim.cfg.SPLAT_FORCE, sim.nextColor());
         pmx = mx; pmy = my;
       }
 

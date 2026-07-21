@@ -1,455 +1,278 @@
 /**
  * ClothSimulation.ts
  *
- * Implements a real-time mass-spring-damper cloth simulation using
- * Verlet integration — the standard, numerically stable approach for
- * real-time cloth/particle simulations.
- *
- * Physics model:
- *   - Cloth is a 2D grid of point masses connected by springs
- *   - Three spring types (all essential for realistic-looking cloth):
- *       • Structural: horizontal/vertical neighbors (resist stretching)
- *       • Shear: diagonal neighbors (resist shearing/parallelogram deformation)
- *       • Bend: next-neighbor horizontal/vertical (resist folding/bending)
- *   - Verlet integration: x(t+dt) = 2x(t) - x(t-dt) + a * dt²
- *       Advantage over Euler: velocity is implicit (no explicit velocity storage),
- *       naturally conserves energy better, and is unconditionally stable for
- *       stiff springs with proper constraint projection.
- *   - Constraint satisfaction: spring constraints are projected N times per step
- *     (position-based dynamics style) to prevent excessive elongation.
- *   - Sphere collision: each particle is tested against a sphere and pushed
- *     out if penetrating, giving convincing cloth-over-object draping.
- *
- * The cloth simulation runs on the CPU. At 20x20 to 40x40 resolution
- * (400–1600 particles, ~3000–12000 springs), this runs comfortably at 60fps.
- * Three.js handles GPU rendering of the resulting mesh each frame.
+ * Mass-spring cloth simulation using Verlet integration.
+ * A grid of point masses connected by structural, shear, and bend springs,
+ * with sphere collision and mouse-grab interaction.
  */
 
 import * as THREE from "three";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 export interface ClothConfig {
-  /** Number of particles along each axis */
-  SEGMENTS: number;
-  /** Physical size of the cloth in world units */
-  SIZE: number;
-  /** Gravity acceleration (y-axis, negative = downward) */
-  GRAVITY: number;
-  /** Wind force vector */
-  WIND: THREE.Vector3;
-  /** Spring stiffness [0..1] — how strongly springs resist elongation */
-  STIFFNESS: number;
-  /** Damping factor per step [0..1] — how much velocity is preserved */
-  DAMPING: number;
-  /** Number of constraint relaxation passes per simulation step */
-  CONSTRAINT_ITERATIONS: number;
-  /** Sphere collision object radius */
+  SEGMENTS: number;       // grid points per axis (segments+1 vertices)
+  SIZE: number;           // world-space size
+  GRAVITY: number;        // downward acceleration (negative = down)
+  WIND_X: number;         // wind force X
+  WIND_Z: number;         // wind force Z
+  STIFFNESS: number;      // spring constraint strength 0..1
+  DAMPING: number;        // velocity damping per step
+  CONSTRAINT_ITERS: number;
   SPHERE_RADIUS: number;
 }
 
 export const DEFAULT_CLOTH_CONFIG: ClothConfig = {
-  SEGMENTS: 28,
+  SEGMENTS: 24,
   SIZE: 6,
-  GRAVITY: -12,
-  WIND: new THREE.Vector3(0.5, 0, 0.3),
-  STIFFNESS: 0.95,
+  GRAVITY: -14,
+  WIND_X: 0.6,
+  WIND_Z: 0.25,
+  STIFFNESS: 0.98,
   DAMPING: 0.999,
-  CONSTRAINT_ITERATIONS: 5,
-  SPHERE_RADIUS: 1.5,
+  CONSTRAINT_ITERS: 6,
+  SPHERE_RADIUS: 1.6,
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+
 interface Particle {
-  /** Current position */
   pos: THREE.Vector3;
-  /** Previous position (used by Verlet integration — encodes velocity implicitly) */
-  prevPos: THREE.Vector3;
-  /** Acceleration accumulator (reset each step) */
+  prev: THREE.Vector3;
   acc: THREE.Vector3;
-  /** Inverse mass: 0 = pinned/fixed, 1/m = moveable */
-  invMass: number;
+  pinned: boolean;
 }
 
 interface Spring {
-  a: number;           // Index of particle A
-  b: number;           // Index of particle B
-  restLength: number;  // Natural length of the spring (separation at rest)
-  stiffness: number;   // [0..1] constraint stiffness
+  a: number; b: number;
+  rest: number;
+  stiffness: number;
 }
 
-// ─── Main Class ───────────────────────────────────────────────────────────────
-
 export class ClothSimulation {
-  private config: ClothConfig;
+  public mesh: THREE.Mesh;
+  public sphereMesh: THREE.Mesh;
+  public sphereCenter = new THREE.Vector3(0, 0.2, 0);
+
+  private cfg: ClothConfig;
   private particles: Particle[] = [];
   private springs: Spring[] = [];
-
-  /** Three.js mesh for rendering */
-  public mesh: THREE.Mesh;
-  /** Sphere the cloth drapes over */
-  public sphereMesh: THREE.Mesh;
-  /** Sphere position (center) */
-  public sphereCenter: THREE.Vector3;
-
-  private geometry: THREE.BufferGeometry;
+  private geo: THREE.BufferGeometry;
   private positions: Float32Array;
-  private normals: Float32Array;
-
-  // Mouse interaction
-  private dragParticleIndex = -1;
+  private dragIdx = -1;
   private dragTarget = new THREE.Vector3();
 
-  constructor(config: Partial<ClothConfig> = {}) {
-    this.config = { ...DEFAULT_CLOTH_CONFIG, ...config };
-    this.sphereCenter = new THREE.Vector3(0, 0.5, 0);
+  constructor(cfg: Partial<ClothConfig> = {}) {
+    this.cfg = { ...DEFAULT_CLOTH_CONFIG, ...cfg };
 
-    // Build Three.js geometry and mesh
-    const { geometry, positions, normals } = this.buildGeometry();
-    this.geometry = geometry;
-    this.positions = positions;
-    this.normals = normals;
+    // Geometry
+    const n = this.cfg.SEGMENTS + 1;
+    const vc = n * n;
+    this.positions = new Float32Array(vc * 3);
+    const uvs      = new Float32Array(vc * 2);
+    const seg      = this.cfg.SEGMENTS;
+    const fc       = seg * seg * 2;
+    const idx      = new Uint32Array(fc * 3);
 
-    const material = new THREE.MeshPhysicalMaterial({
-      color: 0x4466ff,
+    for (let y = 0; y < n; y++)
+      for (let x = 0; x < n; x++) {
+        const i = y*n+x;
+        uvs[i*2]   = x/seg;
+        uvs[i*2+1] = y/seg;
+      }
+
+    let ii = 0;
+    for (let y = 0; y < seg; y++)
+      for (let x = 0; x < seg; x++) {
+        const a=y*n+x, b=a+1, c=(y+1)*n+x, d=c+1;
+        idx[ii++]=a; idx[ii++]=c; idx[ii++]=b;
+        idx[ii++]=b; idx[ii++]=c; idx[ii++]=d;
+      }
+
+    this.geo = new THREE.BufferGeometry();
+    this.geo.setAttribute("position", new THREE.BufferAttribute(this.positions, 3).setUsage(THREE.DynamicDrawUsage));
+    this.geo.setAttribute("uv",       new THREE.BufferAttribute(uvs, 2));
+    this.geo.setIndex(new THREE.BufferAttribute(idx, 1));
+
+    // Cloth material — shimmery fabric look
+    const mat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(0.18, 0.25, 0.9),
       side: THREE.DoubleSide,
-      roughness: 0.6,
+      roughness: 0.55,
       metalness: 0.0,
+      transmission: 0.08,
       transparent: true,
-      opacity: 0.92,
-      wireframe: false,
+      opacity: 0.94,
     });
-    this.mesh = new THREE.Mesh(geometry, material);
+    this.mesh = new THREE.Mesh(this.geo, mat);
     this.mesh.castShadow = true;
     this.mesh.receiveShadow = true;
 
-    // Sphere (collision object)
-    const sphereGeo = new THREE.SphereGeometry(this.config.SPHERE_RADIUS, 32, 32);
-    const sphereMat = new THREE.MeshPhysicalMaterial({
-      color: 0x222244,
-      roughness: 0.3,
-      metalness: 0.7,
+    // Sphere
+    const sGeo = new THREE.SphereGeometry(this.cfg.SPHERE_RADIUS, 48, 48);
+    const sMat = new THREE.MeshPhysicalMaterial({
+      color: 0x111128,
+      roughness: 0.15,
+      metalness: 0.85,
+      envMapIntensity: 1.0,
     });
-    this.sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
+    this.sphereMesh = new THREE.Mesh(sGeo, sMat);
     this.sphereMesh.position.copy(this.sphereCenter);
     this.sphereMesh.castShadow = true;
     this.sphereMesh.receiveShadow = true;
 
-    // Initialize particles and springs
     this.reset();
   }
 
-  // ─── Initialization ──────────────────────────────────────────────────────
-
-  private buildGeometry(): { geometry: THREE.BufferGeometry; positions: Float32Array; normals: Float32Array } {
-    const n = this.config.SEGMENTS + 1; // particles per axis
-    const vertCount = n * n;
-    const faceCount = this.config.SEGMENTS * this.config.SEGMENTS * 2;
-
-    const positions = new Float32Array(vertCount * 3);
-    const normals = new Float32Array(vertCount * 3);
-    const uvs = new Float32Array(vertCount * 2);
-    const indices = new Uint32Array(faceCount * 3);
-
-    // UV coordinates
-    for (let y = 0; y < n; y++) {
-      for (let x = 0; x < n; x++) {
-        const i = y * n + x;
-        uvs[i * 2] = x / this.config.SEGMENTS;
-        uvs[i * 2 + 1] = y / this.config.SEGMENTS;
-      }
-    }
-
-    // Quad faces (two triangles each)
-    let idx = 0;
-    for (let y = 0; y < this.config.SEGMENTS; y++) {
-      for (let x = 0; x < this.config.SEGMENTS; x++) {
-        const a = y * n + x;
-        const b = a + 1;
-        const c = (y + 1) * n + x;
-        const d = c + 1;
-        indices[idx++] = a; indices[idx++] = c; indices[idx++] = b;
-        indices[idx++] = b; indices[idx++] = c; indices[idx++] = d;
-      }
-    }
-
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
-    geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3).setUsage(THREE.DynamicDrawUsage));
-    geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-
-    return { geometry, positions, normals };
-  }
-
-  public reset(): void {
-    const { SEGMENTS, SIZE } = this.config;
-    const n = SEGMENTS + 1;
-    const step = SIZE / SEGMENTS;
-    const halfSize = SIZE / 2;
+  reset(): void {
+    const n   = this.cfg.SEGMENTS + 1;
+    const seg = this.cfg.SEGMENTS;
+    const sz  = this.cfg.SIZE;
+    const step = sz / seg;
+    const half = sz / 2;
 
     this.particles = [];
-    this.springs = [];
+    this.springs   = [];
 
-    // Create particles in a grid, initially flat/horizontal
     for (let y = 0; y < n; y++) {
       for (let x = 0; x < n; x++) {
-        const px = x * step - halfSize;
-        const py = SIZE + 1; // Start above the sphere
-        const pz = y * step - halfSize;
-
-        const pos = new THREE.Vector3(px, py, pz);
-        const prevPos = pos.clone();
-
-        // Pin the top two corners (index 0 and n-1 in top row)
-        const isTopCorner = y === 0 && (x === 0 || x === SEGMENTS);
-        const invMass = isTopCorner ? 0 : 1;
-
-        this.particles.push({
-          pos, prevPos,
-          acc: new THREE.Vector3(),
-          invMass,
-        });
+        const px = x*step - half;
+        const py = sz + 2;         // start above sphere
+        const pz = y*step - half;
+        const pos  = new THREE.Vector3(px, py, pz);
+        // Pin the top-left and top-right corners
+        const pinned = y === 0 && (x === 0 || x === seg);
+        this.particles.push({ pos, prev: pos.clone(), acc: new THREE.Vector3(), pinned });
       }
     }
 
-    // Create springs — three types for realistic cloth behaviour
-    const addSpring = (ai: number, bi: number, stiffness: number) => {
-      const restLength = this.particles[ai].pos.distanceTo(this.particles[bi].pos);
-      this.springs.push({ a: ai, b: bi, restLength, stiffness });
+    const add = (ai: number, bi: number, s: number) => {
+      const r = this.particles[ai].pos.distanceTo(this.particles[bi].pos);
+      this.springs.push({ a: ai, b: bi, rest: r, stiffness: s });
     };
 
     for (let y = 0; y < n; y++) {
       for (let x = 0; x < n; x++) {
-        const i = y * n + x;
-
-        // Structural springs (horizontal): resist stretching left-right
-        if (x < SEGMENTS) addSpring(i, i + 1, this.config.STIFFNESS);
-        // Structural springs (vertical): resist stretching up-down
-        if (y < SEGMENTS) addSpring(i, i + n, this.config.STIFFNESS);
-
-        // Shear springs (diagonal): resist shearing deformation
-        // Without these, cloth looks like a net, not fabric
-        if (x < SEGMENTS && y < SEGMENTS) {
-          addSpring(i, i + n + 1, this.config.STIFFNESS * 0.9);
-          addSpring(i + 1, i + n, this.config.STIFFNESS * 0.9);
+        const i = y*n+x;
+        if (x < seg) add(i, i+1,     this.cfg.STIFFNESS);          // structural H
+        if (y < seg) add(i, i+n,     this.cfg.STIFFNESS);          // structural V
+        if (x < seg && y < seg) {
+          add(i,   i+n+1, this.cfg.STIFFNESS*0.85);                // shear \
+          add(i+1, i+n,   this.cfg.STIFFNESS*0.85);                // shear /
         }
-
-        // Bend springs (skip-one): resist bending/folding
-        // Connect to neighbors 2 steps away — these are the "bending stiffness"
-        if (x < SEGMENTS - 1) addSpring(i, i + 2, this.config.STIFFNESS * 0.5);
-        if (y < SEGMENTS - 1) addSpring(i, i + n * 2, this.config.STIFFNESS * 0.5);
+        if (x < seg-1) add(i, i+2,   this.cfg.STIFFNESS*0.5);     // bend H
+        if (y < seg-1) add(i, i+n*2, this.cfg.STIFFNESS*0.5);     // bend V
       }
     }
 
-    // Sync positions to geometry
-    this.syncToGeometry();
+    this.syncGeo();
   }
 
-  // ─── Simulation Step ─────────────────────────────────────────────────────
-
-  /**
-   * Advance the simulation by one timestep.
-   * Uses sub-stepping (multiple small steps) for stability with stiff springs.
-   *
-   * @param dt - elapsed time in seconds (clamped internally to prevent instability)
-   */
-  public step(dt: number): void {
-    // Clamp dt — large timesteps cause instability even with Verlet
-    const clampedDt = Math.min(dt, 1 / 30);
-    // Sub-step count: more sub-steps = more stable, more CPU cost
-    const subSteps = 3;
-    const subDt = clampedDt / subSteps;
-
-    for (let s = 0; s < subSteps; s++) {
-      this.applyForces(subDt);
-      this.integrateVerlet(subDt);
-      this.satisfyConstraints();
-      this.handleSphereCollision();
-      this.handleMouseDrag();
+  step(dt: number): void {
+    const sub = 3;
+    const sdt = Math.min(dt, 1/30) / sub;
+    for (let s = 0; s < sub; s++) {
+      this.forces(sdt);
+      this.integrate(sdt);
+      this.constrain();
+      this.collide();
+      this.applyDrag();
     }
-
-    this.syncToGeometry();
+    this.syncGeo();
   }
 
-  /**
-   * Verlet integration: x(t+dt) = 2x(t) - x(t-dt) + a*dt²
-   *
-   * This is equivalent to a second-order Taylor expansion and is more
-   * accurate than forward Euler while remaining unconditionally stable
-   * for conservative forces. The "velocity" is implicit: v = (x - x_prev) / dt.
-   * No explicit velocity variable is needed.
-   */
-  private integrateVerlet(dt: number): void {
+  private forces(_dt: number): void {
+    const t = performance.now() * 0.001;
+    const gust = Math.sin(t*0.6)*0.35 + Math.sin(t*1.4)*0.2;
+    for (const p of this.particles) {
+      if (p.pinned) continue;
+      p.acc.y += this.cfg.GRAVITY;
+      p.acc.x += (this.cfg.WIND_X + gust) * (0.7 + Math.random()*0.6);
+      p.acc.z += this.cfg.WIND_Z * (0.7 + Math.random()*0.6);
+    }
+  }
+
+  /** Störmer-Verlet: x_new = 2x - x_prev + a·dt²  */
+  private integrate(dt: number): void {
     const dt2 = dt * dt;
     for (const p of this.particles) {
-      if (p.invMass === 0) continue; // Pinned particle — doesn't move
-
-      // Save current position — this becomes prevPos after the step
-      const currentPos = p.pos.clone();
-
-      // Verlet step: x_new = 2*x - x_prev + a*dt²
-      // Rewritten as:  x_new = x + (x - x_prev) + a*dt²
-      // where (x - x_prev) is the implicit velocity times dt
-      const newPos = p.pos.clone()
-        .multiplyScalar(2)
-        .sub(p.prevPos)
-        .addScaledVector(p.acc, dt2);
-
-      // Apply damping: shrink the implicit velocity slightly
-      // Effective velocity after step = (newPos - currentPos)
-      // Damped: reduce by (1 - damping) factor
-      const vel = newPos.clone().sub(currentPos);
-      vel.multiplyScalar(this.config.DAMPING);
-
-      p.pos.copy(currentPos.clone().add(vel));
-      p.prevPos.copy(currentPos);
-      p.acc.set(0, 0, 0); // Reset accumulator for next frame
+      if (p.pinned) { p.acc.set(0,0,0); continue; }
+      const cur  = p.pos.clone();
+      const vel  = cur.clone().sub(p.prev).multiplyScalar(this.cfg.DAMPING);
+      p.pos.copy(cur.clone().add(vel).addScaledVector(p.acc, dt2));
+      p.prev.copy(cur);
+      p.acc.set(0,0,0);
     }
   }
 
-  /** Accumulate external forces into acceleration. */
-  private applyForces(_dt: number): void {
-    const { GRAVITY, WIND } = this.config;
-    // Wind varies slightly over time for organic feel
-    const t = performance.now() * 0.001;
-    const windNoise = Math.sin(t * 0.7) * 0.3 + Math.sin(t * 1.3) * 0.2;
-
-    for (const p of this.particles) {
-      if (p.invMass === 0) continue;
-
-      // Gravity: a = g (directly, since F = m*g and we integrate acceleration)
-      p.acc.y += GRAVITY;
-
-      // Wind: add per-particle turbulence for an organic, billowing look
-      p.acc.x += (WIND.x + windNoise) * (0.8 + Math.random() * 0.4);
-      p.acc.z += WIND.z * (0.8 + Math.random() * 0.4);
-    }
-  }
-
-  /**
-   * Satisfy spring constraints using relaxation (position-based dynamics style).
-   *
-   * For each spring, we compute the current length vs rest length and
-   * move both particles toward each other (or apart) proportionally to
-   * their masses to correct the error. Running this N times per step
-   * converges toward the physically correct spring length.
-   *
-   * This is more stable than force-based spring resolution for cloth.
-   */
-  private satisfyConstraints(): void {
-    for (let iter = 0; iter < this.config.CONSTRAINT_ITERATIONS; iter++) {
-      for (const spring of this.springs) {
-        const pa = this.particles[spring.a];
-        const pb = this.particles[spring.b];
-
-        const delta = pb.pos.clone().sub(pa.pos);
-        const currentLen = delta.length();
-        if (currentLen < 1e-6) continue;
-
-        // How stretched/compressed is this spring?
-        const error = (currentLen - spring.restLength) / currentLen;
-        // Apply correction scaled by stiffness
-        const correction = delta.multiplyScalar(0.5 * error * spring.stiffness);
-
-        // Distribute correction inversely proportional to mass
-        const totalInvMass = pa.invMass + pb.invMass;
-        if (totalInvMass === 0) continue;
-
-        if (pa.invMass > 0) pa.pos.addScaledVector(correction, pa.invMass / totalInvMass * 2);
-        if (pb.invMass > 0) pb.pos.addScaledVector(correction, -pb.invMass / totalInvMass * 2);
+  private constrain(): void {
+    for (let iter = 0; iter < this.cfg.CONSTRAINT_ITERS; iter++) {
+      for (const sp of this.springs) {
+        const pa = this.particles[sp.a];
+        const pb = this.particles[sp.b];
+        const d  = pb.pos.clone().sub(pa.pos);
+        const len = d.length();
+        if (len < 1e-6) continue;
+        const err = (len - sp.rest) / len;
+        const corr = d.multiplyScalar(0.5 * err * sp.stiffness);
+        const wA = pa.pinned ? 0 : 1;
+        const wB = pb.pinned ? 0 : 1;
+        const wSum = wA + wB; if (wSum === 0) continue;
+        if (!pa.pinned) pa.pos.addScaledVector(corr,  wA/wSum * 2);
+        if (!pb.pinned) pb.pos.addScaledVector(corr, -wB/wSum * 2);
       }
     }
   }
 
-  /**
-   * Sphere collision: push particles outside the sphere.
-   * Simple and effective for the "cloth draping over object" visual.
-   */
-  private handleSphereCollision(): void {
-    const r = this.config.SPHERE_RADIUS + 0.05; // small offset to prevent z-fighting
+  private collide(): void {
+    const r = this.cfg.SPHERE_RADIUS + 0.04;
     for (const p of this.particles) {
-      if (p.invMass === 0) continue;
-
-      const diff = p.pos.clone().sub(this.sphereCenter);
-      const dist = diff.length();
-
-      if (dist < r) {
-        // Push the particle to the sphere surface
-        p.pos.copy(this.sphereCenter).addScaledVector(diff, r / dist);
-      }
+      if (p.pinned) continue;
+      const d = p.pos.clone().sub(this.sphereCenter);
+      if (d.length() < r) p.pos.copy(this.sphereCenter).addScaledVector(d.normalize(), r);
     }
   }
 
-  /** Apply mouse drag force to the grabbed particle. */
-  private handleMouseDrag(): void {
-    if (this.dragParticleIndex < 0) return;
-    const p = this.particles[this.dragParticleIndex];
-    if (!p || p.invMass === 0) return;
-
-    // Gently pull particle toward the drag target (not instant snapping)
-    p.pos.lerp(this.dragTarget, 0.3);
-    p.prevPos.copy(p.pos); // Zero out implicit velocity to prevent launch
+  private applyDrag(): void {
+    if (this.dragIdx < 0) return;
+    const p = this.particles[this.dragIdx];
+    if (!p || p.pinned) return;
+    p.pos.lerp(this.dragTarget, 0.35);
+    p.prev.copy(p.pos);
   }
 
-  // ─── Geometry Sync ───────────────────────────────────────────────────────
-
-  /** Copy particle positions to Three.js geometry and recompute normals. */
-  private syncToGeometry(): void {
-    const n = this.config.SEGMENTS + 1;
-
+  private syncGeo(): void {
     for (let i = 0; i < this.particles.length; i++) {
-      const p = this.particles[i];
-      this.positions[i * 3] = p.pos.x;
-      this.positions[i * 3 + 1] = p.pos.y;
-      this.positions[i * 3 + 2] = p.pos.z;
+      const { x, y, z } = this.particles[i].pos;
+      this.positions[i*3]   = x;
+      this.positions[i*3+1] = y;
+      this.positions[i*3+2] = z;
     }
-
-    this.geometry.getAttribute("position").needsUpdate = true;
-    this.geometry.computeVertexNormals();
+    this.geo.getAttribute("position").needsUpdate = true;
+    this.geo.computeVertexNormals();
   }
 
-  // ─── Mouse Interaction ───────────────────────────────────────────────────
-
-  /** Find the closest particle to a 3D world position (for mouse picking). */
-  public grabParticle(worldPos: THREE.Vector3): void {
-    let minDist = Infinity;
-    let closest = -1;
-    for (let i = 0; i < this.particles.length; i++) {
-      const p = this.particles[i];
-      if (p.invMass === 0) continue;
+  // ── Mouse interaction ───────────────────────────────────────────────────────
+  grab(worldPos: THREE.Vector3): void {
+    let best = Infinity, idx = -1;
+    this.particles.forEach((p, i) => {
+      if (p.pinned) return;
       const d = p.pos.distanceTo(worldPos);
-      if (d < minDist) { minDist = d; closest = i; }
-    }
-    if (minDist < 2.0) { // Only grab if close enough
-      this.dragParticleIndex = closest;
-      this.dragTarget.copy(worldPos);
-    }
+      if (d < best) { best = d; idx = i; }
+    });
+    if (best < 3.0) { this.dragIdx = idx; this.dragTarget.copy(worldPos); }
+  }
+  drag(wp: THREE.Vector3): void { this.dragTarget.copy(wp); }
+  release(): void { this.dragIdx = -1; }
+
+  setWireframe(v: boolean): void {
+    (this.mesh.material as THREE.MeshPhysicalMaterial).wireframe = v;
   }
 
-  public moveDrag(worldPos: THREE.Vector3): void {
-    this.dragTarget.copy(worldPos);
+  updateConfig(c: Partial<ClothConfig>): void {
+    this.cfg = { ...this.cfg, ...c };
   }
 
-  public releaseDrag(): void {
-    this.dragParticleIndex = -1;
-  }
-
-  // ─── Public Config ───────────────────────────────────────────────────────
-
-  public updateConfig(partial: Partial<ClothConfig>): void {
-    this.config = { ...this.config, ...partial };
-  }
-
-  public getConfig(): ClothConfig {
-    return { ...this.config };
-  }
-
-  public setWireframe(enabled: boolean): void {
-    (this.mesh.material as THREE.MeshPhysicalMaterial).wireframe = enabled;
-  }
-
-  public dispose(): void {
-    this.geometry.dispose();
+  dispose(): void {
+    this.geo.dispose();
     (this.mesh.material as THREE.Material).dispose();
   }
 }

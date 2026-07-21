@@ -165,12 +165,27 @@ export class FluidSimulation {
 
   // ─── Initialization ──────────────────────────────────────────────────────
 
+  // Whether the GPU supports rendering to half-float / float textures
+  private halfFloatSupport = false;
+  private floatSupport = false;
+
   private init(): void {
     const gl = this.gl;
 
-    // Enable required extensions for half-float / float textures
-    const extFloat = gl.getExtension("EXT_color_buffer_float");
-    if (!extFloat) console.warn("EXT_color_buffer_float not available — falling back to half-float");
+    // WebGL2 requires explicit extension opt-in for float render targets.
+    // EXT_color_buffer_float covers both float and half-float.
+    // EXT_color_buffer_half_float is the fallback for half-float only.
+    this.floatSupport = !!gl.getExtension("EXT_color_buffer_float");
+    if (!this.floatSupport) {
+      this.halfFloatSupport = !!gl.getExtension("EXT_color_buffer_half_float");
+      console.warn("EXT_color_buffer_float unavailable; halfFloat:", this.halfFloatSupport);
+    } else {
+      this.halfFloatSupport = true;
+    }
+
+    // LINEAR filtering on half-float textures (needed for advection bilinear)
+    gl.getExtension("OES_texture_half_float_linear");
+    gl.getExtension("OES_texture_float_linear");
 
     // Compile all shader programs
     this.advectionProgram = this.createProgram(baseVert, advectionFrag, [
@@ -216,17 +231,35 @@ export class FluidSimulation {
     const gl = this.gl;
     const { SIM_RESOLUTION, DYE_RESOLUTION } = this.config;
 
-    // Determine actual resolution respecting viewport aspect ratio
     const simSize = this.getResolution(SIM_RESOLUTION);
     const dyeSize = this.getResolution(DYE_RESOLUTION);
 
-    // Create double-buffered framebuffers for ping-pong
-    this.velocity = this.createDoubleFramebuffer(simSize.w, simSize.h, gl.RG16F, gl.RG, gl.HALF_FLOAT, gl.LINEAR);
-    this.dye = this.createDoubleFramebuffer(dyeSize.w, dyeSize.h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
-    this.pressure = this.createDoubleFramebuffer(simSize.w, simSize.h, gl.R16F, gl.RED, gl.HALF_FLOAT, gl.NEAREST);
+    // Choose texture formats based on GPU support.
+    // Half-float (HALF_FLOAT) is preferred: sufficient precision, less memory.
+    // Fall back to UNSIGNED_BYTE (RGBA8) if float render targets aren't supported.
+    const useHalf = this.halfFloatSupport;
+    const halfType = gl.HALF_FLOAT;
+    const byteType = gl.UNSIGNED_BYTE;
 
-    // Single framebuffer for divergence (read-only by pressure solver)
-    const { tex: divTex, fbo: divFbo } = this.createFramebuffer(simSize.w, simSize.h, gl.R16F, gl.RED, gl.HALF_FLOAT, gl.NEAREST);
+    const velFmt = useHalf
+      ? { internal: gl.RG16F,   format: gl.RG,   type: halfType }
+      : { internal: gl.RGBA,    format: gl.RGBA,  type: byteType };
+    const dyeFmt = useHalf
+      ? { internal: gl.RGBA16F, format: gl.RGBA,  type: halfType }
+      : { internal: gl.RGBA,    format: gl.RGBA,  type: byteType };
+    const presFmt = useHalf
+      ? { internal: gl.R16F,    format: gl.RED,   type: halfType }
+      : { internal: gl.RGBA,    format: gl.RGBA,  type: byteType };
+
+    this.velocity = this.createDoubleFramebuffer(
+      simSize.w, simSize.h, velFmt.internal, velFmt.format, velFmt.type, gl.LINEAR);
+    this.dye = this.createDoubleFramebuffer(
+      dyeSize.w, dyeSize.h, dyeFmt.internal, dyeFmt.format, dyeFmt.type, gl.LINEAR);
+    this.pressure = this.createDoubleFramebuffer(
+      simSize.w, simSize.h, presFmt.internal, presFmt.format, presFmt.type, gl.NEAREST);
+
+    const { tex: divTex, fbo: divFbo } = this.createFramebuffer(
+      simSize.w, simSize.h, presFmt.internal, presFmt.format, presFmt.type, gl.NEAREST);
     this.divergenceBuffer = { fbo: divFbo, tex: divTex, texelSize: [1 / simSize.w, 1 / simSize.h] };
   }
 
@@ -292,7 +325,13 @@ export class FluidSimulation {
     const fbo = gl.createFramebuffer()!;
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-    // Clear to zero
+
+    // Verify the framebuffer is complete — if not, the texture format is unsupported
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.error(`Framebuffer incomplete: 0x${status.toString(16)} — format ${internalFormat} may be unsupported`);
+    }
+
     gl.viewport(0, 0, w, h);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);

@@ -80,7 +80,7 @@ export default function ControlPanel({
               <Slider label="Velocity Decay" value={fluidConfig.VELOCITY_DISSIPATION??0.98} min={0.88} max={1.0} step={0.001} fmt={v=>v.toFixed(3)} onChange={v=>onFluidConfig({VELOCITY_DISSIPATION:v})}/>
               <Slider label="Color Decay"    value={fluidConfig.DYE_DISSIPATION??0.977} min={0.88} max={1.0} step={0.001} fmt={v=>v.toFixed(3)} onChange={v=>onFluidConfig({DYE_DISSIPATION:v})}/>
               <Slider label="Force"          value={fluidConfig.SPLAT_FORCE??6000}    min={1000} max={15000} step={100} fmt={v=>Math.round(v).toString()} onChange={v=>onFluidConfig({SPLAT_FORCE:v})}/>
-              <Slider label="Brush Size"     value={fluidConfig.SPLAT_RADIUS??0.25}   min={0.05} max={0.8}  step={0.01} fmt={v=>v.toFixed(2)} onChange={v=>onFluidConfig({SPLAT_RADIUS:v})}/>
+              <Slider label="Brush Size"     value={(fluidConfig.SPLAT_RADIUS??0.004)*1000} min={1} max={20} step={0.5} fmt={v=>v.toFixed(1)} onChange={v=>onFluidConfig({SPLAT_RADIUS:v/1000})}/>
             </>}
 
             {mode === "cloth" && <>

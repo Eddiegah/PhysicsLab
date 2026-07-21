@@ -26,7 +26,7 @@ export const DEFAULT_CONFIG: FluidConfig = {
   PRESSURE_ITERATIONS: 20,
   VELOCITY_DISSIPATION: 0.98,
   DYE_DISSIPATION: 0.977,
-  SPLAT_RADIUS: 0.25,   // in % of shorter screen dimension
+  SPLAT_RADIUS: 0.004,  // UV-space radius — keep between 0.001 and 0.02
   SPLAT_FORCE: 6000,
 };
 
@@ -196,8 +196,8 @@ export class FluidSimulation {
     this.buildQuad();
     this.buildPrograms();
     this.buildFBOs();
-    // Initial random splats — deferred one frame so canvas has correct size
-    setTimeout(() => this.randomSplats(8), 0);
+    // Fire initial splats immediately — canvas is already sized by caller
+    this.randomSplats(10);
   }
 
   // ── Quad ────────────────────────────────────────────────────────────────────
@@ -381,7 +381,7 @@ export class FluidSimulation {
 
   splat(x: number, y: number, dx: number, dy: number, color: [number,number,number]): void {
     const gl = this.gl;
-    const r = this.cfg.SPLAT_RADIUS / 100.0; // convert % to 0..1
+    const r = this.cfg.SPLAT_RADIUS; // already in UV space
 
     // Velocity splat
     gl.useProgram(this.pSpl.prog);
@@ -401,13 +401,16 @@ export class FluidSimulation {
 
   randomSplats(n: number): void {
     const cols = PALETTES[this.palette];
+    const savedR = this.cfg.SPLAT_RADIUS;
+    this.cfg.SPLAT_RADIUS = 0.008; // bigger radius for initial burst
     for (let i = 0; i < n; i++) {
       this.splat(
         Math.random(), Math.random(),
-        (Math.random()-0.5)*0.3, (Math.random()-0.5)*0.3,
+        (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4,
         cols[i % cols.length]
       );
     }
+    this.cfg.SPLAT_RADIUS = savedR;
   }
 
   nextColor(): [number,number,number] {
